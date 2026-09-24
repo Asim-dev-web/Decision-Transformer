@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+pydantic
+numpy
+gymnasium[box2d]
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
