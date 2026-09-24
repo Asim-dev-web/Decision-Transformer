@@ -1,196 +1,199 @@
-# Decision Transformer: Lunar Lander
+# Decision Transformer for Continuous Control (Lunar Lander)
 
-An offline reinforcement learning implementation that frames the continuous Lunar Lander control problem as autoregressive sequence modeling. The system conditions on a user-specified Target Return-to-Go (RTG) to generate trajectory actions, served via a FastAPI inference backend and visualized through an interactive HTML5 Canvas flight deck.
+An offline reinforcement learning model that reformulates continuous control in OpenAI Gymnasium's `LunarLanderContinuous-v2` as conditional sequence modeling. 
 
----
-
-## Overview
-
-Unlike standard reinforcement learning algorithms that optimize policy or value functions using temporal difference updates (such as PPO or SAC), the Decision Transformer casts policy execution as conditional sequence generation.
-
-During inference, the model is prompted with an initial target return R_0, an initial environment state S_0, and an initial action prompt. At each subsequent environment step t, the backend updates the remaining return:
-
-R_{t+1} = R_t - r_t
-
-The Transformer processes the interleaved context sequence:
-
-tau = (R_1, S_1, A_1, R_2, S_2, A_2, ..., R_t, S_t)
-
-Using a causal attention mask, the network outputs continuous action predictions (main thrust, side thrust) conditioned on achieving the requested trajectory return.
+Instead of computing value functions (Q-learning) or calculating policy gradients (PPO/SAC), this architecture utilizes an autoregressive decoder-only Transformer to model joint distributions over sequences of returns-to-go, states, and actions. At inference time, the model generates continuous thrust actions conditioned on a desired target return.
 
 ---
 
-## Architecture and Key Specifications
+## 1. Formulation: Reinforcement Learning as Sequence Modeling
 
-### 1. Model Backbone (PyTorch)
-* Token Embeddings: Modality-specific linear projections mapping scalar Return-to-Go, state vector (R^8), and continuous action vector (R^2) into a shared 128-dimensional embedding space.
-* Timestep Embeddings: Global episode step embeddings shared equally across (R_t, S_t, A_t) at each time step.
-* Causal Transformer: Multi-head self-attention with lower-triangular causal masking to enforce strictly autoregressive sequence generation.
-* Continuous Action Head: Linear projection on the S_t hidden state, trained with Mean Squared Error (MSE) loss against offline expert and sub-optimal trajectories.
+Traditional RL optimizes for expected cumulative reward:
 
-### 2. Backend Service (FastAPI & Docker)
-* Exposes `POST /simulate` to accept a specified `target_return`.
-* Executes the closed-loop rollout against the OpenAI Gymnasium `LunarLanderContinuous-v2` / `v3` environment.
-* Returns structured frame-by-frame telemetry arrays (coordinates, angles, velocities, engine states, rewards, step termination flags).
-* Packaged in a lightweight Docker container for uniform execution.
+$$\max_{\pi} \mathbb{E}_{\tau \sim \pi} \left[ \sum_{t=0}^{T} r_t \right]$$
 
-### 3. Frontend & Visualizer (React, Vite, HTML5 Canvas)
-* Real-time vector-style canvas rendering decoupled from React state updates to maintain a stable 60 FPS animation loop without UI thread blocking.
-* Interactive Target Return slider allowing real-time trajectory comparison between sub-optimal returns (e.g., negative or low RTG) and clean landing trajectories (e.g., +200 to +250 RTG).
-* Integrated telemetry HUD displaying altitude, vertical/horizontal velocity, and thrust vectors.
+The Decision Transformer drops temporal difference backups and value estimations entirely. A trajectory is represented as a sequence of three interleaved modalities: Return-to-Go ($\hat{R}$), State ($s$), and Action ($a$):
+
+$$\tau = \left( \hat{R}_1, s_1, a_1, \hat{R}_2, s_2, a_2, \dots, \hat{R}_T, s_T, a_T \right)$$
+
+Where Return-to-Go represents the sum of future rewards from timestep $t$ until the end of the episode:
+
+$$\hat{R}_t = \sum_{t'=t}^{T} r_{t'}$$
+
+During execution, action generation simplifies to conditional autoregressive modeling:
+
+$$a_t = \arg\max_a P\left(a \mid \tau_{<t}, \hat{R}_t, s_t\right)$$
+
+To achieve optimal behavior, we prompt the model with a high initial return ($\hat{R}_0 \ge +200$) and let it emit actions consistent with expert performance.
 
 ---
 
-## Repository Structure
+## 2. Model Architecture
+
+The core network (`core/model.py`) is an autoregressive decoder Transformer operating over a context window of length $K = 20$ timesteps (60 tokens).
+
+### Multimodal Token Embedding
+Because the modalities have mismatched raw dimensions, each input is linearly projected into a shared latent dimension $d_{\text{model}} = 128$:
+
+* **Return-to-Go:** Linear projection $\mathbb{R}^1 \to \mathbb{R}^{128}$
+* **State Space:** Linear projection $\mathbb{R}^8 \to \mathbb{R}^{128}$ (coordinates, linear velocities, angle, angular velocity, ground contact flags)
+* **Action Space:** Linear projection $\mathbb{R}^2 \to \mathbb{R}^{128}$ (continuous main and lateral engine thrust)
+
+### Global Timestep Embedding
+Unlike text models where positional encodings represent the token's index in the prompt (0, 1, 2, ...), the Decision Transformer uses **global episode timestep embeddings**. 
+
+Because $\hat{R}_t$, $s_t$, and $a_t$ describe the exact same physical instant, all three tokens receive the identical timestep embedding vector $e_t \in \mathbb{R}^{128}$:
+
+$$z_{\hat{R}_t} = \text{Embed}_R(\hat{R}_t) + e_t$$
+$$z_{s_t} = \text{Embed}_s(s_t) + e_t$$
+$$z_{a_t} = \text{Embed}_a(a_t) + e_t$$
+
+Tokens are interleaved chronologically:
+
+$$Z = \left[ z_{\hat{R}_1}, z_{s_1}, z_{a_1}, z_{\hat{R}_2}, z_{s_2}, z_{a_2}, \dots, z_{\hat{R}_t}, z_{s_t} \right]$$
+
+### Causal Masking & Attention Pattern
+The token sequence is passed through stacked Multi-Head Self-Attention layers:
+
+$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}} + M\right)V$$
+
+To prevent the model from looking ahead into future transitions or observing the action $a_t$ before predicting it, a lower-triangular causal mask $M$ is enforced:
+
+$$M_{i,j} = \begin{cases} 0 & j \le i \\ -\infty & j > i \end{cases}$$
+
+Under this causal order, when predicting action $a_t$, the model processes $z_{s_t}$ by attending strictly to:
+* All past returns, states, and actions: $\hat{R}_{1:t-1}, s_{1:t-1}, a_{1:t-1}$
+* The current target return: $\hat{R}_t$
+* The current environment state: $s_t$
+
+### Continuous Action Prediction Head
+The transformer outputs hidden states $h \in \mathbb{R}^{3K \times 128}$. The hidden state corresponding specifically to the current state token $h_{s_t}$ is sliced out and passed through a final linear layer to predict the 2D continuous action vector:
+
+$$\hat{a}_t = \tanh\left(W_a h_{s_t} + b_a\right)$$
+
+The network is optimized end-to-end using Mean Squared Error (MSE) loss against target continuous actions:
+
+$$\mathcal{L}_{\text{MSE}} = \frac{1}{\vert{}B\vert{}} \sum_{i \in B} \Vert{}\hat{a}_t^{(i)} - a_t^{(i)}\Vert{}_2^2$$
+
+---
+
+## 3. Offline Dataset Pipeline
+
+Decision Transformers require diverse offline datasets spanning both expert and sub-optimal trajectories so the model learns the correlation between low returns and failed landings versus high returns and stable descents.
+
+* **Trajectory Collection (`training/dataset_creation.py`):** Runs rollouts in `LunarLanderContinuous-v2` across various behavioral checkpoints (heuristic pilots, sub-optimal checkpoints, and expert policies) to capture an unbiased distribution of states, actions, and terminal rewards.
+* **Return-to-Go Processing (`training/dataset_loading.py`):** Trajectories are processed in reverse ($T \to 0$) to compute cumulative ground-truth returns at every timestep. Sequences are sliced into fixed context lengths ($K$) and zero-padded when episode lengths are shorter than $K$.
+* **Dataset Artifact (`training/lunar_lander_dataset.pt`):** Serialized PyTorch tensor dataset containing pre-batched states, actions, returns, timesteps, and attention masks.
+
+---
+
+## 4. Closed-Loop Inference Loop
+
+At evaluation time, the environment provides observations sequentially. The rollout script maintains a sliding context buffer:
+
+1. **Initialize:** Prompt the context with user-specified Target Return $\hat{R}_0$ (e.g., $200.0$) and initial environment state $s_0$.
+2. **Predict:** Pass the context window $\tau_{t-K:t}$ through the Transformer. Slice out the prediction corresponding to $s_t$ to retrieve action vector $a_t = [\text{main thrust}, \text{side thrust}]$.
+3. **Step Environment:** Execute $a_t$ in the environment, observe step reward $r_t$ and next state $s_{t+1}$.
+4. **Update Return-to-Go:** Compute the remaining target return:
+   $$\hat{R}_{t+1} = \hat{R}_t - r_t$$
+5. **Shift Context:** Append $\hat{R}_{t+1}$ and $s_{t+1}$ to the context tensor. If the sequence length exceeds context limit $K$, slide the window forward by dropping the oldest transition.
+
+---
+
+## 5. Repository Layout
 
 ```text
 .
-├── backend/
-│   ├── app/
-│   │   ├── main.py              # FastAPI service and /simulate endpoint
-│   │   ├── model.py             # Decision Transformer PyTorch architecture
-│   │   └── rollout.py           # Closed-loop evaluation and rollout loop
-│   ├── weights/                 # Model checkpoints (.pt)
-│   ├── Dockerfile
-│   └── requirements.txt
+├── api/
+│   └── main.py                 # FastAPI inference service exposing POST /simulate
+├── core/
+│   ├── dt_lunar_lander.pth     # Trained PyTorch Decision Transformer checkpoint
+│   └── model.py                # PyTorch architecture (embeddings, causal attention, heads)
 ├── frontend/
-│   ├── src/
-│   │   ├── components/
-│   │   │   ├── SimCanvas.jsx    # 60 FPS vector renderer and animation loop
-│   │   │   ├── TelemetryHUD.jsx # Flight metrics and status displays
-│   │   │   └── Controls.jsx     # Return slider and trigger actions
-│   │   ├── App.jsx
-│   │   └── main.jsx
+│   ├── src/                    # React + Vite retro vector visualizer (60 FPS Canvas HUD)
 │   ├── package.json
 │   └── vite.config.js
+├── training/
+│   ├── dataset_creation.py     # Trajectory sampling across performance tiers
+│   ├── dataset_loading.py      # Sequence batching, padding, and RTG computation
+│   ├── lunar_lander_dataset.pt # Offline training trajectory dataset
+│   └── train.py                # Autoregressive training loop and loss tracking
 ├── .gitignore
-├── LICENSE
-└── README.md
+├── Dockerfile                  # Container build file for the inference API
+├── LICENSE                     # MIT License
+├── play.py                     # Direct local rollout script
+├── README.md
+└── requirements.txt            # Core ML dependencies (torch, gymnasium, fastapi)
 ```
 
 ---
 
-## Getting Started
+## 6. Getting Started
 
-### Prerequisites
+### Installation
 
-* Docker and Docker Compose (recommended), OR Python 3.10+
-* Node.js (v18+) and npm
+Clone the repository and set up a Python virtual environment:
 
----
+```bash
+git clone [https://github.com/](https://github.com/)<username>/decision-transformer.git
+cd decision-transformer
 
-### Backend Setup
-
-#### Option A: Running via Docker (Recommended)
-
-1. Navigate to the backend directory:
-   ```bash
-   cd backend
-   ```
-
-2. Build the Docker image:
-   ```bash
-   docker build -t lunar-lander-api .
-   ```
-
-3. Run the container:
-   ```bash
-   docker run -p 8000:8000 lunar-lander-api
-   ```
-
-The API will be available at `http://127.0.0.1:8000`. You can inspect endpoints and test queries directly via Swagger documentation at `http://127.0.0.1:8000/docs`.
-
-#### Option B: Running Locally with Python
-
-1. Navigate to the backend directory and set up a virtual environment:
-   ```bash
-   cd backend
-   python -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-   ```
-
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. Start the FastAPI server:
-   ```bash
-   uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
-   ```
-
----
-
-### Frontend Setup
-
-1. Open a separate terminal and navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-3. Start the Vite development server:
-   ```bash
-   npm run dev
-   ```
-
-4. Open `http://localhost:5173` in your browser.
-
----
-
-## API Reference
-
-### `POST /simulate`
-
-Runs an autoregressive rollout loop conditioned on the requested Target Return.
-
-**Request Payload:**
-```json
-{
-  "target_return": 200.0
-}
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-**Response Format:**
-```json
-{
-  "status": "LANDED",
-  "total_reward": 218.4,
-  "steps": 142,
-  "frames": [
-    {
-      "step": 0,
-      "x": 0.012,
-      "y": 1.402,
-      "vx": -0.05,
-      "vy": -0.12,
-      "angle": 0.02,
-      "angular_velocity": 0.01,
-      "main_thrust": 0.78,
-      "side_thrust": -0.12,
-      "reward": 0.45,
-      "rtg": 200.0
-    }
-  ]
-}
+### Model Training
+
+To retrain the Decision Transformer from the offline dataset:
+
+```bash
+python training/train.py
+```
+
+The script trains the autoregressive sequence head over `training/lunar_lander_dataset.pt` and saves the updated weights to `core/dt_lunar_lander.pth`.
+
+### Local Inference & Rollout
+
+Run a direct rollout in Gymnasium to evaluate the trained model:
+
+```bash
+python play.py
 ```
 
 ---
 
-## Technical Details: Decoupled Canvas Rendering
+## 7. Serving & Visualization
 
-To maintain smooth frame delivery and avoid input latency, the frontend isolates the rendering loop from React state:
+To test the model interactively across different conditioned target returns, the repository includes a lightweight inference API and a decoupled HTML5 canvas visualizer.
 
-* React handles outer UI state (input sliders, connection indicators, mission configuration).
-* High-frequency telemetry updates (velocity, coordinates, frame stepping) are painted directly to the Canvas via `requestAnimationFrame` context calls rather than triggering React component reconciliations on every frame.
-* CSS rules avoid expensive real-time filter overlays like full-viewport `backdrop-filter` or cumulative `drop-shadow`, preserving frame rates on integrated GPUs.
+### 1. Launch Inference API (FastAPI)
+
+Run via Docker:
+```bash
+docker build -t lunar-lander-api .
+docker run -p 8000:8000 lunar-lander-api
+```
+
+Or run directly with Uvicorn:
+```bash
+uvicorn api.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+The service exposes `POST /simulate`, which takes a JSON payload `{"target_return": 200.0}`, executes the closed-loop Decision Transformer rollout, and streams back the trajectory frames.
+
+### 2. Launch Visualizer (React + Canvas)
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open `http://localhost:5173` to access the mission control dashboard. You can adjust the Return-to-Go slider from $-200$ (conditioned crash) to $+250$ (conditioned soft landing) to observe how the transformer dynamically adapts its control policy based purely on return conditioning.
 
 ---
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
