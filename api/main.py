@@ -30,6 +30,11 @@ model.eval()
 class SimulationRequest(BaseModel):
     target_return: float
 
+@app.get("/api/health")
+@app.get("/health")
+def health_check():
+    return {"status": "alive"}
+
 @app.post("/simulate")
 def simulate(request: SimulationRequest):
     env = gym.make("LunarLander-v3", continuous=True)
