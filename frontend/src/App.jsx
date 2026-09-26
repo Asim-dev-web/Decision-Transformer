@@ -15,7 +15,7 @@ import MissionLog from "./components/MissionLog";
 import Telemetry from "./components/Telemetry";
 import { METERS_PER_UNIT } from "./constants";
 
-const API_URL = "http://127.0.0.1:8000/simulate";
+const API_URL = "https://decision-transformer-api.onrender.com/simulate";
 const MIN_TARGET = -200;
 const MAX_TARGET = 250;
 const SPEEDS = [0.5, 1, 2, 4];
